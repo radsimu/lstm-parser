@@ -21,9 +21,11 @@
 #include "cnn/cnn.h"
 #include "cnn/expr.h"
 #include "cnn/lstm.h"
-#include "c2.h"
+#include "ucca-corpus.h"
 
-cpyp::Corpus corpus;
+#include "passage.h"
+
+ucca::Corpus corpus;
 volatile bool requested_stop = false;
 unsigned LAYERS = 2;
 unsigned INPUT_DIM = 40;
@@ -31,17 +33,17 @@ unsigned HIDDEN_DIM = 60;
 unsigned ACTION_DIM = 36;
 unsigned PRETRAINED_DIM = 50;
 unsigned LSTM_INPUT_DIM = 60;
-unsigned POS_DIM = 10;
+unsigned TYPE_DIM = 10;
 unsigned REL_DIM = 8;
 
 
-bool USE_POS = false;
+bool USE_TYPE = false;
 
 constexpr const char* ROOT_SYMBOL = "ROOT";
 unsigned kROOT_SYMBOL = 0;
 unsigned ACTION_SIZE = 0;
 unsigned VOCAB_SIZE = 0;
-unsigned POS_SIZE = 0;
+unsigned TYPE_SIZE = 0;
 
 using namespace cnn::expr;
 using namespace cnn;
@@ -60,13 +62,13 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
         ("unk_strategy,o", po::value<unsigned>()->default_value(1), "Unknown word strategy: 1 = singletons become UNK with probability unk_prob")
         ("unk_prob,u", po::value<double>()->default_value(0.2), "Probably with which to replace singletons with UNK in training data")
         ("model,m", po::value<string>(), "Load saved model from this file")
-        ("use_pos_tags,P", "make POS tags visible to parser")
+        ("use_types_tags,P", "make TYPE tags visible to parser")
         ("layers", po::value<unsigned>()->default_value(2), "number of LSTM layers")
         ("action_dim", po::value<unsigned>()->default_value(16), "action embedding size")
         ("input_dim", po::value<unsigned>()->default_value(32), "input embedding size")
         ("hidden_dim", po::value<unsigned>()->default_value(64), "hidden dimension")
         ("pretrained_dim", po::value<unsigned>()->default_value(50), "pretrained input dimension")
-        ("pos_dim", po::value<unsigned>()->default_value(12), "POS dimension")
+        ("pos_dim", po::value<unsigned>()->default_value(12), "TYPE dimension")
         ("rel_dim", po::value<unsigned>()->default_value(10), "relation dimension")
         ("lstm_input_dim", po::value<unsigned>()->default_value(60), "LSTM input dimension")
         ("train,t", "Should training be run?")
@@ -105,7 +107,7 @@ struct ParserBuilder {
   Parameters* p_D; // dependency matrix for composition function
   Parameters* p_R; // relation matrix for composition function
   Parameters* p_w2l; // word to LSTM input
-  Parameters* p_p2l; // POS to LSTM input
+  Parameters* p_p2l; // TYPE to LSTM input
   Parameters* p_t2l; // pretrained word embeddings to LSTM input
   Parameters* p_ib; // LSTM input bias
   Parameters* p_cbias; // composition function bias
@@ -138,9 +140,9 @@ struct ParserBuilder {
 
       p_buffer_guard(model->add_parameters(Dim(LSTM_INPUT_DIM, 1))),
       p_stack_guard(model->add_parameters(Dim(LSTM_INPUT_DIM, 1))) {
-    if (USE_POS) {
-      p_p = model->add_lookup_parameters(POS_SIZE, Dim(POS_DIM, 1));
-      p_p2l = model->add_parameters(Dim(LSTM_INPUT_DIM, POS_DIM));
+    if (USE_TYPE) {
+      p_p = model->add_lookup_parameters(TYPE_SIZE, Dim(TYPE_DIM, 1));
+      p_p2l = model->add_parameters(Dim(LSTM_INPUT_DIM, TYPE_DIM));
     }
     if (pretrained.size() > 0) {
       p_t = model->add_lookup_parameters(VOCAB_SIZE, Dim(PRETRAINED_DIM, 1));
@@ -184,7 +186,7 @@ static map<int,int> compute_heads(unsigned sent_len, const vector<unsigned>& act
   for (unsigned i = 0; i < sent_len; ++i)
     bufferi[sent_len - i] = i;
   bufferi[0] = -999;
-  for (auto action: actions) { // loop over transitions for sentence
+  for (auto action: actions) { // loop over transitions for passage
     const string& actionString=setOfActions[action];
     const char ac = actionString[0];
     const char ac2 = actionString[1];
@@ -220,15 +222,15 @@ static map<int,int> compute_heads(unsigned sent_len, const vector<unsigned>& act
 }
 
 // *** if correct_actions is empty, this runs greedy decoding ***
-// returns parse actions for input sentence (in training just returns the reference)
+// returns parse actions for input passage (in training just returns the reference)
 // OOV handling: raw_sent will have the actual words
 //               sent will have words replaced by appropriate UNK tokens
 // this lets us use pretrained embeddings, when available, for words that were OOV in the
 // parser training data
 vector<unsigned> log_prob_parser(ComputationGraph* hg,
-                     const vector<unsigned>& raw_sent,  // raw sentence
+                     const vector<unsigned>& raw_sent,  // raw passage
                      const vector<unsigned>& sent,  // sent with oovs replaced
-                     const vector<unsigned>& sentPos,
+                     const vector<unsigned>& sentType,
                      const vector<unsigned>& correct_actions,
                      const vector<string>& setOfActions,
                      const map<unsigned, std::string>& intToWords,
@@ -254,7 +256,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
     Expression ib = parameter(*hg, p_ib);
     Expression w2l = parameter(*hg, p_w2l);
     Expression p2l;
-    if (USE_POS)
+    if (USE_TYPE)
       p2l = parameter(*hg, p_p2l);
     Expression t2l;
     if (p_t2l)
@@ -265,8 +267,8 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
 
     action_lstm.add_input(action_start);
 
-    vector<Expression> buffer(sent.size() + 1);  // variables representing word embeddings (possibly including POS info)
-    vector<int> bufferi(sent.size() + 1);  // position of the words in the sentence
+    vector<Expression> buffer(sent.size() + 1);  // variables representing word embeddings (possibly including TYPE info)
+    vector<int> bufferi(sent.size() + 1);  // position of the words in the passage
     // precompute buffer representation from left to right
 
     for (unsigned i = 0; i < sent.size(); ++i) {
@@ -274,8 +276,8 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
       Expression w =lookup(*hg, p_w, sent[i]);
 
       vector<Expression> args = {ib, w2l, w}; // learn embeddings
-      if (USE_POS) { // learn POS tag?
-        Expression p = lookup(*hg, p_p, sentPos[i]);
+      if (USE_TYPE) { // learn TYPE tag?
+        Expression p = lookup(*hg, p_p, sentType[i]);
         args.push_back(p2l);
         args.push_back(p);
       }
@@ -294,7 +296,7 @@ vector<unsigned> log_prob_parser(ComputationGraph* hg,
       buffer_lstm.add_input(b);
 
     vector<Expression> stack;  // variables representing subtree embeddings
-    vector<int> stacki; // position of words in the sentence of head of subtree
+    vector<int> stacki; // position of words in the passage of head of subtree
     stack.push_back(parameter(*hg, p_stack_guard));
     stacki.push_back(-999); // not used for anything
     // drive dummy symbol on stack through LSTM
@@ -459,43 +461,34 @@ unsigned compute_correct(const map<int,T1>& ref1, const map<int,T1>& hyp1,
   return res;
 }
 
-void output_conll(const vector<unsigned>& sentence, const vector<unsigned>& pos,
-                  const vector<string>& sentenceUnkStrings,
-                  const map<unsigned, string>& intToWords,
-                  const map<unsigned, string>& intToPos,
-                  const map<int,int>& hyp, const map<int,string>& rel_hyp) {
-  for (unsigned i = 0; i < (sentence.size()-1); ++i) {
+void output_xml(const vector<unsigned> &passage, const vector<unsigned> &pos,
+                const vector<string> &passageUnkStrings,
+                const map<unsigned, string> &intToWords,
+                const map<unsigned, string> &intToType,
+                const map<int, int> &hyp, const map<int, string> &rel_hyp) {
+  for (unsigned i = 0; i < (passage.size()-1); ++i) {
     auto index = i + 1;
-    assert(i < sentenceUnkStrings.size() &&
-           ((sentence[i] == corpus.get_or_add_word(cpyp::Corpus::UNK) &&
-             sentenceUnkStrings[i].size() > 0) ||
-            (sentence[i] != corpus.get_or_add_word(cpyp::Corpus::UNK) &&
-             sentenceUnkStrings[i].size() == 0 &&
-             intToWords.find(sentence[i]) != intToWords.end())));
-    string wit = (sentenceUnkStrings[i].size() > 0)?
-      sentenceUnkStrings[i] : intToWords.find(sentence[i])->second;
-    auto pit = intToPos.find(pos[i]);
+    assert(i < passageUnkStrings.size() &&
+           ((passage[i] == corpus.get_or_add_word(ucca::Corpus::UNK) &&
+             passageUnkStrings[i].size() > 0) ||
+            (passage[i] != corpus.get_or_add_word(ucca::Corpus::UNK) &&
+             passageUnkStrings[i].size() == 0 &&
+             intToWords.find(passage[i]) != intToWords.end())));
+    string wit = (passageUnkStrings[i].size() > 0)?
+      passageUnkStrings[i] : intToWords.find(passage[i])->second;
+    auto pit = intToType.find(pos[i]);
     assert(hyp.find(i) != hyp.end());
     auto hyp_head = hyp.find(i)->second + 1;
-    if (hyp_head == (int)sentence.size()) hyp_head = 0;
+    if (hyp_head == (int)passage.size()) hyp_head = 0;
     auto hyp_rel_it = rel_hyp.find(i);
     assert(hyp_rel_it != rel_hyp.end());
     auto hyp_rel = hyp_rel_it->second;
     size_t first_char_in_rel = hyp_rel.find('(') + 1;
     size_t last_char_in_rel = hyp_rel.rfind(')') - 1;
     hyp_rel = hyp_rel.substr(first_char_in_rel, last_char_in_rel - first_char_in_rel + 1);
-    cout << index << '\t'       // 1. ID
-         << wit << '\t'         // 2. FORM
-         << "_" << '\t'         // 3. LEMMA
-         << "_" << '\t'         // 4. CPOSTAG
-         << pit->second << '\t' // 5. POSTAG
-         << "_" << '\t'         // 6. FEATS
-         << hyp_head << '\t'    // 7. HEAD
-         << hyp_rel << '\t'     // 8. DEPREL
-         << "_" << '\t'         // 9. PHEAD
-         << "_" << endl;        // 10. PDEPREL
+    Passage p(0);
+    p.save(cout);
   }
-  cout << endl;
 }
 
 void init_pretrained(istream &in) {
@@ -524,7 +517,7 @@ int main(int argc, char** argv) {
 
   po::variables_map conf;
   InitCommandLine(argc, argv, &conf);
-  USE_POS = conf.count("use_pos_tags");
+  USE_TYPE = conf.count("use_types_tags");
 
   LAYERS = conf["layers"].as<unsigned>();
   INPUT_DIM = conf["input_dim"].as<unsigned>();
@@ -532,7 +525,7 @@ int main(int argc, char** argv) {
   HIDDEN_DIM = conf["hidden_dim"].as<unsigned>();
   ACTION_DIM = conf["action_dim"].as<unsigned>();
   LSTM_INPUT_DIM = conf["lstm_input_dim"].as<unsigned>();
-  POS_DIM = conf["pos_dim"].as<unsigned>();
+  TYPE_DIM = conf["pos_dim"].as<unsigned>();
   REL_DIM = conf["rel_dim"].as<unsigned>();
   const unsigned unk_strategy = conf["unk_strategy"].as<unsigned>();
   cerr << "Unknown word strategy: ";
@@ -550,21 +543,21 @@ int main(int argc, char** argv) {
     cerr << "Optimization tolerance: " << tolerance << "\n";
   }
   ostringstream os;
-  os << "parser_" << (USE_POS ? "pos" : "nopos")
+  os << "parser_" << (USE_TYPE ? "pos" : "nopos")
      << '_' << LAYERS
      << '_' << INPUT_DIM
      << '_' << HIDDEN_DIM
      << '_' << ACTION_DIM
      << '_' << LSTM_INPUT_DIM
-     << '_' << POS_DIM
+     << '_' << TYPE_DIM
      << '_' << REL_DIM
      << "-pid" << getpid() << ".params";
   int best_correct_heads = 0;
-  const string fname = os.str();
+  const string fname = conf.count("model") ? conf["model"].as<string>() : os.str();
   cerr << "Writing parameters to file: " << fname << endl;
   bool softlinkCreated = false;
   corpus.load_correct_actions(conf["training_data"].as<string>());
-  const unsigned kUNK = corpus.get_or_add_word(cpyp::Corpus::UNK);
+  const unsigned kUNK = corpus.get_or_add_word(ucca::Corpus::UNK);
   kROOT_SYMBOL = corpus.get_or_add_word(ROOT_SYMBOL);
 
   if (conf.count("words")) {
@@ -588,7 +581,7 @@ int main(int argc, char** argv) {
   set<unsigned> singletons;
   {  // compute the singletons in the parser's training data
     map<unsigned, unsigned> counts;
-    for (auto sent : corpus.sentences)
+    for (auto sent : corpus.passages)
       for (auto word : sent.second) { training_vocab.insert(word); counts[word]++; }
     for (auto wc : counts)
       if (wc.second == 1) singletons.insert(wc.first);
@@ -597,7 +590,7 @@ int main(int argc, char** argv) {
   cerr << "Number of words: " << corpus.nwords << endl;
   VOCAB_SIZE = corpus.nwords + 1;
   ACTION_SIZE = corpus.nactions + 1;
-  POS_SIZE = corpus.npos + 10;  // bad way of dealing with the fact that we may see new POS tags in the test set
+  TYPE_SIZE = corpus.ntypes + 10;  // bad way of dealing with the fact that we may see new TYPE tags in the test set
   possible_actions.resize(corpus.nactions);
   for (unsigned i = 0; i < corpus.nactions; ++i)
     possible_actions[i] = i;
@@ -619,13 +612,13 @@ int main(int argc, char** argv) {
     //MomentumSGDTrainer sgd(&model);
     sgd.eta_decay = 0.08;
     //sgd.eta_decay = 0.05;
-    vector<unsigned> order(corpus.nsentences);
-    for (unsigned i = 0; i < corpus.nsentences; ++i)
+    vector<unsigned> order(corpus.npassages);
+    for (unsigned i = 0; i < corpus.npassages; ++i)
       order[i] = i;
     double tot_seen = 0;
-    status_every_i_iterations = min(status_every_i_iterations, corpus.nsentences);
-    unsigned si = corpus.nsentences;
-    cerr << "NUMBER OF TRAINING SENTENCES: " << corpus.nsentences << endl;
+    status_every_i_iterations = min(status_every_i_iterations, corpus.npassages);
+    unsigned si = corpus.npassages;
+    cerr << "NUMBER OF TRAINING SENTENCES: " << corpus.npassages << endl;
     unsigned trs = 0;
     double right = 0;
     double llh = 0;
@@ -638,26 +631,26 @@ int main(int argc, char** argv) {
     while(!requested_stop && iter < maxit &&
         (tolerance < 0 || uas < 0 || prev_uas < 0 || abs(prev_uas - uas) > tolerance)) {
       for (unsigned sii = 0; sii < status_every_i_iterations; ++sii) {
-           if (si == corpus.nsentences) {
+           if (si == corpus.npassages) {
              si = 0;
              if (first) { first = false; } else { sgd.update_epoch(); }
              cerr << "**SHUFFLE\n";
              random_shuffle(order.begin(), order.end());
            }
            tot_seen += 1;
-           const vector<unsigned>& sentence=corpus.sentences[order[si]];
-           vector<unsigned> tsentence=sentence;
+           const vector<unsigned>& passage=corpus.passages[order[si]];
+           vector<unsigned> tpassage=passage;
            if (unk_strategy == 1) {
-             for (auto& w : tsentence)
+             for (auto& w : tpassage)
                if (singletons.count(w) && cnn::rand01() < unk_prob) w = kUNK;
            }
-           const vector<unsigned>& sentencePos=corpus.sentencesPos[order[si]];
+           const vector<unsigned>& passageType=corpus.passagesType[order[si]];
            const vector<unsigned>& actions=corpus.correct_act_sent[order[si]];
            ComputationGraph hg;
-           parser.log_prob_parser(&hg,sentence,tsentence,sentencePos,actions,corpus.actions,corpus.intToWords,&right);
+           parser.log_prob_parser(&hg,passage,tpassage,passageType,actions,corpus.actions,corpus.intToWords,&right);
            double lp = as_scalar(hg.incremental_forward());
            if (lp < 0) {
-             cerr << "Log prob < 0 on sentence " << order[si] << ": lp=" << lp << endl;
+             cerr << "Log prob < 0 on passage " << order[si] << ": lp=" << lp << endl;
              assert(lp >= 0.0);
            }
            hg.backward();
@@ -668,13 +661,13 @@ int main(int argc, char** argv) {
       }
       sgd.status();
       time_t time_now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-      cerr << "update #" << iter << " (epoch " << (tot_seen / corpus.nsentences) << " |time=" << put_time(localtime(&time_now), "%c %Z") << ")\tllh: "<< llh<<" ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << endl;
+      cerr << "update #" << iter << " (epoch " << (tot_seen / corpus.npassages) << " |time=" << put_time(localtime(&time_now), "%c %Z") << ")\tllh: "<< llh<<" ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << endl;
       llh = trs = right = 0;
 
       static int logc = 0;
       ++logc;
       if (logc % 25 == 1) { // report on dev set
-        unsigned dev_size = corpus.nsentencesDev;
+        unsigned dev_size = corpus.npassagesDev;
         // dev_size = 100;
         double llh = 0;
         double trs = 0;
@@ -683,28 +676,27 @@ int main(int argc, char** argv) {
         double total_heads = 0;
         auto t_start = std::chrono::high_resolution_clock::now();
         for (unsigned sii = 0; sii < dev_size; ++sii) {
-           const vector<unsigned>& sentence=corpus.sentencesDev[sii];
-           const vector<unsigned>& sentencePos=corpus.sentencesPosDev[sii];
+           const vector<unsigned>& passage=corpus.passagesDev[sii];
+           const vector<unsigned>& passageType=corpus.passagesTypeDev[sii];
            const vector<unsigned>& actions=corpus.correct_act_sentDev[sii];
-           vector<unsigned> tsentence=sentence;
-           for (auto& w : tsentence)
+           vector<unsigned> tpassage=passage;
+           for (auto& w : tpassage)
              if (training_vocab.count(w) == 0) w = kUNK;
 
            ComputationGraph hg;
-           vector<unsigned> pred = parser.log_prob_parser(&hg,sentence,tsentence,sentencePos,vector<unsigned>(),corpus.actions,corpus.intToWords,&right);
+           vector<unsigned> pred = parser.log_prob_parser(&hg,passage,tpassage,passageType,vector<unsigned>(),corpus.actions,corpus.intToWords,&right);
            double lp = 0;
            llh -= lp;
            trs += actions.size();
-           map<int,int> ref = parser.compute_heads(sentence.size(), actions, corpus.actions);
-           map<int,int> hyp = parser.compute_heads(sentence.size(), pred, corpus.actions);
-           //output_conll(sentence, corpus.intToWords, ref, hyp);
-           correct_heads += compute_correct(ref, hyp, sentence.size() - 1);
-           total_heads += sentence.size() - 1;
+           map<int,int> ref = parser.compute_heads(passage.size(), actions, corpus.actions);
+           map<int,int> hyp = parser.compute_heads(passage.size(), pred, corpus.actions);
+           correct_heads += compute_correct(ref, hyp, passage.size() - 1);
+           total_heads += passage.size() - 1;
         }
         auto t_end = std::chrono::high_resolution_clock::now();
         prev_uas = uas;
         uas = correct_heads / total_heads;
-        cerr << "  **dev (iter=" << iter << " epoch=" << (tot_seen / corpus.nsentences) << ")\tllh=" << llh << " ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << " uas: " << uas << "\t[" << dev_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
+        cerr << "  **dev (iter=" << iter << " epoch=" << (tot_seen / corpus.npassages) << ")\tllh=" << llh << " ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << " uas: " << uas << "\t[" << dev_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
         if (correct_heads > best_correct_heads) {
           best_correct_heads = correct_heads;
           ofstream out(fname);
@@ -739,34 +731,30 @@ int main(int argc, char** argv) {
     double correct_heads_labeled = 0;
     double total_heads = 0;
     auto t_start = std::chrono::high_resolution_clock::now();
-    unsigned corpus_size = corpus.nsentencesDev;
+    unsigned corpus_size = corpus.npassagesDev;
     for (unsigned sii = 0; sii < corpus_size; ++sii) {
-      const vector<unsigned>& sentence=corpus.sentencesDev[sii];
-      const vector<unsigned>& sentencePos=corpus.sentencesPosDev[sii];
-      const vector<string>& sentenceUnkStr=corpus.sentencesStrDev[sii];
+      const vector<unsigned>& passage=corpus.passagesDev[sii];
+      const vector<unsigned>& passageType=corpus.passagesTypeDev[sii];
+      const vector<string>& passageUnkStr=corpus.passagesStrDev[sii];
       const vector<unsigned>& actions=corpus.correct_act_sentDev[sii];
-      vector<unsigned> tsentence=sentence;
-      for (auto& w : tsentence)
+      vector<unsigned> tpassage=passage;
+      for (auto& w : tpassage)
         if (training_vocab.count(w) == 0) w = kUNK;
       ComputationGraph cg;
       double lp = 0;
       vector<unsigned> pred;
-      pred = parser.log_prob_parser(&cg,sentence,tsentence,sentencePos,vector<unsigned>(),corpus.actions,corpus.intToWords,&right);
+      pred = parser.log_prob_parser(&cg,passage,tpassage,passageType,vector<unsigned>(),corpus.actions,corpus.intToWords,&right);
       llh -= lp;
       trs += actions.size();
       map<int, string> rel_ref, rel_hyp;
-      map<int,int> ref = parser.compute_heads(sentence.size(), actions, corpus.actions, &rel_ref);
-      map<int,int> hyp = parser.compute_heads(sentence.size(), pred, corpus.actions, &rel_hyp);
-      output_conll(sentence, sentencePos, sentenceUnkStr, corpus.intToWords, corpus.intToPos, hyp, rel_hyp);
-      correct_heads_unlabeled += compute_correct(ref, hyp, sentence.size() - 1);
-      correct_heads_labeled += compute_correct(ref, hyp, rel_ref, rel_hyp, sentence.size() - 1);
-      total_heads += sentence.size() - 1;
+      map<int,int> ref = parser.compute_heads(passage.size(), actions, corpus.actions, &rel_ref);
+      map<int,int> hyp = parser.compute_heads(passage.size(), pred, corpus.actions, &rel_hyp);
+      output_xml(passage, passageType, passageUnkStr, corpus.intToWords, corpus.intToType, hyp, rel_hyp);
+      correct_heads_unlabeled += compute_correct(ref, hyp, passage.size() - 1);
+      correct_heads_labeled += compute_correct(ref, hyp, rel_ref, rel_hyp, passage.size() - 1);
+      total_heads += passage.size() - 1;
     }
     auto t_end = std::chrono::high_resolution_clock::now();
     cerr << "TEST llh=" << llh << " ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << " uas: " << (correct_heads_unlabeled / total_heads) << " las: " << (correct_heads_labeled / total_heads) << "\t[" << corpus_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
-  }
-  for (unsigned i = 0; i < corpus.actions.size(); ++i) {
-    //cerr << corpus.actions[i] << '\t' << parser.p_r->values[i].transpose() << endl;
-    //cerr << corpus.actions[i] << '\t' << parser.p_p2a->values.col(i).transpose() << endl;
   }
 }
