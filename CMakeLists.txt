@@ -6,8 +6,7 @@ set(CMAKE_CXX_FLAGS "-Wall -std=c++11 -O3 -g")
 
 enable_testing()
 
-#include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cnn)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cnn ${CMAKE_CURRENT_SOURCE_DIR}/ucca)
 set(WITH_EIGEN_BACKEND 1)
 
 # look for Boost
@@ -15,7 +14,7 @@ if(DEFINED ENV{BOOST_ROOT})
   set(Boost_NO_SYSTEM_PATHS ON)
 endif()
 set(Boost_REALPATH ON)
-find_package(Boost COMPONENTS program_options serialization iostreams system filesystem REQUIRED)
+find_package(Boost COMPONENTS program_options serialization iostreams REQUIRED)
 include_directories(${Boost_INCLUDE_DIR})
 set(LIBS ${LIBS} ${Boost_LIBRARIES})
 
@@ -26,7 +25,7 @@ include_directories(${EIGEN3_INCLUDE_DIR})
 #configure_file(${CMAKE_CURRENT_SOURCE_DIR}/config.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config.h)
 
 add_subdirectory(cnn/cnn)
-# add_subdirectory(cnn/examples)
+add_subdirectory(cnn/examples)
 add_subdirectory(ucca)
 add_subdirectory(parser)
 

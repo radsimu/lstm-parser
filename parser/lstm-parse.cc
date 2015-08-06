@@ -21,9 +21,9 @@
 #include "cnn/cnn.h"
 #include "cnn/expr.h"
 #include "cnn/lstm.h"
-#include "ucca-corpus.h"
+#include "ucca/ucca-corpus.h"
 
-#include "passage.h"
+#include "ucca/passage.h"
 
 ucca::Corpus corpus;
 volatile bool requested_stop = false;
@@ -461,34 +461,35 @@ unsigned compute_correct(const map<int,T1>& ref1, const map<int,T1>& hyp1,
   return res;
 }
 
-void output_xml(const vector<unsigned> &passage, const vector<unsigned> &pos,
-                const vector<string> &passageUnkStrings,
+void output_xml(const vector<unsigned> &terminals, const vector<unsigned> &types,
+                const vector<unsigned> &nonterminals,
+                const vector<string> &unknown,
                 const map<unsigned, string> &intToWords,
                 const map<unsigned, string> &intToType,
+                const map<int, int> &preterminals,
                 const map<int, int> &hyp, const map<int, string> &rel_hyp) {
-  for (unsigned i = 0; i < (passage.size()-1); ++i) {
-    auto index = i + 1;
-    assert(i < passageUnkStrings.size() &&
-           ((passage[i] == corpus.get_or_add_word(ucca::Corpus::UNK) &&
-             passageUnkStrings[i].size() > 0) ||
-            (passage[i] != corpus.get_or_add_word(ucca::Corpus::UNK) &&
-             passageUnkStrings[i].size() == 0 &&
-             intToWords.find(passage[i]) != intToWords.end())));
-    string wit = (passageUnkStrings[i].size() > 0)?
-      passageUnkStrings[i] : intToWords.find(passage[i])->second;
-    auto pit = intToType.find(pos[i]);
+  ucca::Passage p(0);
+  for (unsigned i = 0; i < terminals.size()-1; ++i) {
+    assert(i < unknown.size() &&
+           (terminals[i] == corpus.get_or_add_word(ucca::Corpus::UNK) && !unknown[i].empty() ||
+            terminals[i] != corpus.get_or_add_word(ucca::Corpus::UNK) && unknown[i].empty() &&
+            intToWords.find(terminals[i]) != intToWords.end()));
+    string terminal = unknown[i].empty() ? intToWords.find(terminals[i])->second : unknown[i];
+    string type = intToType.find(types[i]);
+    p.layers[0].nodes[position] = new ucca::Node(string("0.") + to_string(i + 1), type);
+  }
+  for (unsigned i = 0; i < nonterminals.size()-1; ++i) {
     assert(hyp.find(i) != hyp.end());
     auto hyp_head = hyp.find(i)->second + 1;
-    if (hyp_head == (int)passage.size()) hyp_head = 0;
+    if (hyp_head == (int) terminals.size()) hyp_head = 0;
     auto hyp_rel_it = rel_hyp.find(i);
     assert(hyp_rel_it != rel_hyp.end());
     auto hyp_rel = hyp_rel_it->second;
     size_t first_char_in_rel = hyp_rel.find('(') + 1;
     size_t last_char_in_rel = hyp_rel.rfind(')') - 1;
     hyp_rel = hyp_rel.substr(first_char_in_rel, last_char_in_rel - first_char_in_rel + 1);
-    Passage p(0);
-    p.save(cout);
   }
+  p.save(cout);
 }
 
 void init_pretrained(istream &in) {
@@ -496,7 +497,7 @@ void init_pretrained(istream &in) {
   vector<float> v(PRETRAINED_DIM, 0);
   string word;
   while (getline(in, line)) {
-    if (word.empty() && line.find('.') == std::string::npos)
+    if (word.empty() && line.find('.') == std::string::npos) // no float number in line
       continue; // first line contains vocabulary size and dimensions
     istringstream lin(line);
     lin >> word;
