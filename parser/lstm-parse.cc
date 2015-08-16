@@ -144,11 +144,11 @@ struct ParserBuilder {
   }
 
 static bool IsActionForbidden(const string& a, unsigned bsize, unsigned ssize, const vector<int>& stacki) {
-  if (a[1]=='W' && ssize<3) return true;
   if (a[1]=='W') {
-        int top=stacki[stacki.size()-1];
-        int sec=stacki[stacki.size()-2];
-        if (sec>top) return true;
+    if (ssize<3) return true;
+    int top=stacki[stacki.size()-1];
+    int sec=stacki[stacki.size()-2];
+    if (sec>top) return true;
   }
 
   bool is_shift = (a[0] == 'S' && a[1]=='H');
@@ -165,16 +165,22 @@ static bool IsActionForbidden(const string& a, unsigned bsize, unsigned ssize, c
 
 // take a vector of actions and return a parse tree (labeling of every
 // word position with its head's position)
-static map<unsigned,unsigned> compute_heads(unsigned sent_len, const vector<unsigned>& actions,
+static map<unsigned,unsigned> compute_heads(unsigned passage_len, const vector<unsigned>& actions,
                                             const vector<string>& setOfActions,
-                                            map<unsigned,string>* pr = nullptr) {
+                                            vector<unsigned>* nonterminals = nullptr,
+                                            map<unsigned, unsigned>* preterminals = nullptr,
+                                            map<unsigned, string>* pr = nullptr) {
   map<unsigned,unsigned> heads;
   map<unsigned,string> r;
   map<unsigned,string>& rels = (pr ? *pr : r);
-  for(unsigned i=0;i<sent_len;i++) { heads[i]=-1; rels[i]="ERROR"; }
-  vector<int> bufferi(sent_len + 1, 0), stacki(1, -999);
-  for (unsigned i = 0; i < sent_len; ++i)
-    bufferi[sent_len - i] = i;
+  for(unsigned i=0;i< passage_len;i++) {
+    heads[i]=-1;
+    rels[i]="ERROR";
+  }
+  vector<int> bufferi(passage_len + 1, 0), stacki(1, -999);
+  for (unsigned i = 0; i < passage_len; ++i) {
+    bufferi[passage_len - i] = i;
+  }
   bufferi[0] = -999;
   for (auto action: actions) { // loop over transitions for passage
     const string& actionString=setOfActions[action];
@@ -207,7 +213,6 @@ static map<unsigned,unsigned> compute_heads(unsigned sent_len, const vector<unsi
     }
   }
   assert(bufferi.size() == 1);
-  //assert(stacki.size() == 2);
   return heads;
 }
 
@@ -491,8 +496,12 @@ void output_xml(unsigned passage_id,
     auto hyp_rel = hyp_rel_it->second;
     size_t first_char_in_rel = hyp_rel.find('(') + 1;
     size_t last_char_in_rel = hyp_rel.rfind(')') - 1;
+    auto remote = hyp_rel.substr(0, first_char_in_rel);
     hyp_rel = hyp_rel.substr(first_char_in_rel, last_char_in_rel - first_char_in_rel + 1);
     ucca::Edge* edge = p.add_edge(1, it->first, 1, it->second, hyp_rel);
+    if (remote == ucca::REMOTE_PREFIX) {
+      edge->remote = true;
+    }
     if (edge->type == ucca::LR) {
       edge->from->type = ucca::LKG;
     }
